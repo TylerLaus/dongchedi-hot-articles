@@ -5,9 +5,9 @@
 // Run from the desired output directory:
 //   node ~/.claude/skills/dongchedi-hot-articles/fetch.mjs
 
-import { execFile } from 'node:child_process';
+import { execFile, execFileSync } from 'node:child_process';
 import { promisify } from 'node:util';
-import { writeFileSync, mkdirSync, existsSync, createWriteStream } from 'node:fs';
+import { writeFileSync, readFileSync, mkdirSync, existsSync, createWriteStream, realpathSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import path from 'node:path';
 import https from 'node:https';
@@ -24,6 +24,64 @@ const STATE_PATH = path.join(OUT_ROOT, 'state.json');
 
 const log = (...a) => console.error('[fetch]', ...a);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// Self-heal opencli's page.js so screenshot --path mode and stdout base64 mode both work.
+// Root cause: in v1.7.18, page.screenshot() forwards the daemon's { session, data } envelope
+// directly to saveBase64ToFile() (Buffer type error) and to console.log() (util.inspect truncates
+// long strings at 10000 chars → half-black PNGs when fetch.mjs decodes the truncated base64).
+// Fix: unwrap the envelope before saving or returning. Idempotent — runs on every fetch start.
+function ensureOpencliPatched() {
+  try {
+    const bin = execFileSync('which', ['opencli'], { encoding: 'utf8' }).trim();
+    if (!bin) return;
+    const real = realpathSync(bin);
+    const pkgDir = real.split('/dist/')[0];
+    const pageJs = path.join(pkgDir, 'dist/src/browser/page.js');
+    if (!existsSync(pageJs)) return;
+    const src = readFileSync(pageJs, 'utf8');
+    if (src.includes('// dongchedi-fetch patch:')) return; // already patched
+    const oldBlock = `    async screenshot(options = {}) {
+        const base64 = await sendCommand('screenshot', {
+            ...this._cmdOpts(),
+            format: options.format,
+            quality: options.quality,
+            fullPage: options.fullPage,
+            width: options.width,
+            height: options.height,
+        });
+        if (options.path) {
+            await saveBase64ToFile(base64, options.path);
+        }
+        return base64;
+    }`;
+    const newBlock = `    async screenshot(options = {}) {
+        const _r = await sendCommand('screenshot', {
+            ...this._cmdOpts(),
+            format: options.format,
+            quality: options.quality,
+            fullPage: options.fullPage,
+            width: options.width,
+            height: options.height,
+        });
+        // dongchedi-fetch patch: unwrap { session, data } envelope so saveBase64ToFile gets a
+        // string and console.log gets a string (not an object that util.inspect would truncate).
+        const base64 = typeof _r === 'string' ? _r : (_r && typeof _r.data === 'string' ? _r.data : '');
+        if (options.path) {
+            await saveBase64ToFile(base64, options.path);
+        }
+        return base64;
+    }`;
+    if (!src.includes(oldBlock)) {
+      log(`  WARN: opencli page.js at ${pageJs} doesn't match expected v1.7.18 shape — skipping auto-patch (screenshots may produce half-black images)`);
+      return;
+    }
+    writeFileSync(pageJs, src.replace(oldBlock, newBlock), 'utf8');
+    log(`  patched opencli page.js (unwrap screenshot envelope) at ${pageJs}`);
+  } catch (e) {
+    log(`  WARN: opencli auto-patch check failed: ${String(e.message || e).slice(0, 160)}`);
+  }
+}
+ensureOpencliPatched();
 
 async function opencli(args) {
   const { stdout } = await execFileP('opencli', [...args, '-f', 'json'], {
@@ -42,27 +100,48 @@ function stripBanners(s) {
     .join('\n')
     .trim();
 }
+const BROWSER_SESSION = 'dongchedi-fetch';
+
+async function browserBind() {
+  // Best-effort: bind current Chrome tab to our session (v1.7.18+ requirement).
+  // The --session flag must come BEFORE the subcommand at the `browser` group level.
+  try {
+    await execFileP('opencli', ['browser', '--session', BROWSER_SESSION, 'bind'], {
+      encoding: 'utf8',
+      env: { ...process.env, OPENCLI_BROWSER_COMMAND_TIMEOUT: '30000' },
+      maxBuffer: 10 * 1024 * 1024,
+    });
+  } catch (e) {
+    log(`  browser bind warn: ${String(e.message || e).slice(0, 100)}`);
+  }
+}
 async function browserEval(js) {
-  const { stdout } = await execFileP('opencli', ['browser', 'eval', js], {
+  const { stdout } = await execFileP('opencli', ['browser', '--session', BROWSER_SESSION, 'eval', js], {
     encoding: 'utf8',
     env: { ...process.env, OPENCLI_BROWSER_COMMAND_TIMEOUT: '60000' },
     maxBuffer: 50 * 1024 * 1024,
   });
   const cleaned = stripBanners(stdout);
-  // First valid JSON object/array in output
   const i = cleaned.search(/[{\[]/);
   if (i < 0) throw new Error('no JSON in browser eval output: ' + cleaned.slice(0, 200));
-  return JSON.parse(cleaned.slice(i));
+  const parsed = JSON.parse(cleaned.slice(i));
+  // v1.7.18+ wraps result as { session, data, ... }; unwrap if envelope detected.
+  if (parsed && typeof parsed === 'object' && !Array.isArray(parsed) && 'data' in parsed && 'session' in parsed) {
+    return parsed.data;
+  }
+  return parsed;
 }
 async function browserOpen(url) {
-  await execFileP('opencli', ['browser', 'open', url], {
+  await execFileP('opencli', ['browser', '--session', BROWSER_SESSION, 'open', url], {
     encoding: 'utf8',
     env: { ...process.env, OPENCLI_BROWSER_COMMAND_TIMEOUT: '60000' },
     maxBuffer: 10 * 1024 * 1024,
   });
 }
+// Screenshot the current bound tab to a file at the given viewport size.
+// Requires opencli's page.js patched to unwrap { session, data } envelope before saveBase64ToFile.
 async function browserScreenshot(outPath, width, height) {
-  await execFileP('opencli', ['browser', 'screenshot', `--width=${width}`, `--height=${height}`, outPath], {
+  await execFileP('opencli', ['browser', '--session', BROWSER_SESSION, 'screenshot', `--width=${width}`, `--height=${height}`, outPath], {
     encoding: 'utf8',
     env: { ...process.env, OPENCLI_BROWSER_COMMAND_TIMEOUT: '60000' },
     maxBuffer: 10 * 1024 * 1024,
@@ -181,11 +260,13 @@ for (let i = 0; i < urls.length; i++) {
 log(`  pass 1: ${pass1Ok} ok / ${pass1Fail} fail`);
 
 // ---------- 3b. Pass 2: Screenshot fallback for failed URLs ----------
-// Strategy: for each article gid, open /article/<gid> (Chrome loads images natively),
-// then for each failed URL, isolate the matching <img> via DOM tweaks and screenshot at natural size.
+// Strategy: for each article gid, open /article/<gid> (Chrome loads images via <img>, no CORS issues),
+// then for each failed URL, isolate the matching <img> via position:fixed at natural size and screenshot.
+// Direct-fetch CORS is blocked by byteimg; page-context fetch is also blocked; only the live <img> works.
 const failedUrls = urls.filter((u) => !localOf[u]);
 if (failedUrls.length > 0) {
   log(`3/4 (pass 2) screenshotting ${failedUrls.length} images via Chrome...`);
+  await browserBind();
 
   // Build: which article gids own the failed urls
   const gidsToProcess = new Set();
@@ -239,9 +320,20 @@ if (failedUrls.length > 0) {
       log(`    eval fail: ${String(e.message || e).slice(0, 120)}`);
       continue;
     }
+    if (!Array.isArray(imgs)) {
+      log(`    no img list (eval returned non-array)`);
+      continue;
+    }
 
     for (const url of failedHere) {
       const id = urlIdentity(url);
+      // Idempotency: skip if PNG already exists from a previous run
+      const reuseHash = hashUrl(url);
+      const reusePath = path.join(IMG_DIR, `${reuseHash}.png`);
+      if (existsSync(reusePath)) {
+        localOf[url] = `images/${reuseHash}.png`;
+        continue;
+      }
       const match = imgs.find((m) => m.srcId === id);
       if (!match) continue;
 
@@ -358,7 +450,7 @@ const state = {
       for (const e of full.inlineImages || []) {
         const local = mapImg(e.src);
         if (local && !usedPaths.has(local)) {
-          inlineImages.push({ path: local, caption: e.caption || null });
+          inlineImages.push({ path: local, caption: e.caption || null, nearText: e.nearText || null });
           usedPaths.add(local);
         }
       }
