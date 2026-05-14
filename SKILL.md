@@ -83,18 +83,20 @@ source ~/.nvm/nvm.sh && node ~/.claude/skills/dongchedi-hot-articles/fetch.mjs
 
 ## 配图规则（关键：图文对齐）
 
-`coverImages` 和 `inlineImages` 现在是对象数组：`[{ path, caption }]`。**`caption` 是图在原文里的图说**（如「全新紫色车身涂装」「7座车型第三排座椅新增大床模式」），是图文对齐的关键依据。
+`inlineImages` 是对象数组：`[{ path, caption, nearText }]`。
+- **`caption`**：原文里的图说（来自 `<p class="pgc-img-caption">`）。传统资讯类文章常有，KOL 自媒体文章常为 null。
+- **`nearText`**：图在原文 HTML 里**前一段 `<p>` 的文字**。即使 caption 为 null，nearText 也能告诉你这张图在原文什么内容附近，是 KOL 文章下的主要对齐依据。
 
-### 选图原则
+### 选图原则（按优先级）
 
-1. **封面 1 张**：从 `coverImages[0]` 取。封面通常没有 caption（为 null）
-2. **正文配图**：从 `inlineImages` 里按 caption 与段落内容的关联挑。例如：
-   - 你写的段落讲「外观/紫色配色」→ 找 caption 含「紫」「涂装」「外观」的图
-   - 你写的段落讲「第三排座椅大床模式」→ 找 caption 含「第三排」「大床」的图
-   - 你写的段落讲「电池/动力」→ 找 caption 含「电池」「充电」「动力」「发动机」的图
-3. **不要乱插**：如果某段落找不到强相关的图，宁可不插图，也不要硬塞无关图
-4. **caption=null 的图**：通常是装饰/分隔图，慎用；可以放文章末尾作收尾，或不用
-5. **可选：在图下面用 `*<caption>*` 显示图说**，让读者看明白图的内容（公众号常见做法）
+1. **封面 1 张**：从 `coverImages[0]` 取。封面通常 caption/nearText 都为 null
+2. **正文配图**：
+   - 优先用 `caption`（如果有）
+   - 没 caption 时**用 nearText**判断图的语义。例：nearText 写「车身尺寸 5015×2007×1597 mm」→ 这张图大概率是侧面或外观特写
+   - 把你新文里**主题相近的段落**和图的 nearText 对齐
+3. **不要乱插**：caption 和 nearText 都跟当前段落不搭，就**不插图**，也不要硬塞
+4. **caption=null 且 nearText 也很短/空**：装饰图，慎用；放结尾或不用
+5. **可选**：图下方用 `*<caption 或者 nearText 的关键短语>*` 标注，让读者看明白图的内容（公众号常见做法）
 6. 不重复用同一张图
 
 ### 配图频率
@@ -133,8 +135,8 @@ source ~/.nvm/nvm.sh && node ~/.claude/skills/dongchedi-hot-articles/fetch.mjs
           "url": "https://www.dongchedi.com/article/...",
           "coverImages": [{ "path": "images/abc.jpg", "caption": null }],
           "inlineImages": [
-            { "path": "images/def.jpg", "caption": "全新紫色车身涂装" },
-            { "path": "images/ghi.jpg", "caption": "7座车型第三排新增大床模式" }
+            { "path": "images/def.jpg", "caption": "全新紫色车身涂装", "nearText": "外观方面，新车提供全新紫色车身涂装..." },
+            { "path": "images/ghi.jpg", "caption": null, "nearText": "7座车型第三排新增大床模式，座椅靠背支持电动调节和翻折..." }
           ],
           "stats": { "read": 581, "digg": 0, "comment": 1 }
         },
